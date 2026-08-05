@@ -1,4 +1,5 @@
 Flask
 olefile
 Pillow
+pyembroidery
 gunicorn
