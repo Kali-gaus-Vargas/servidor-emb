@@ -1,8 +1,11 @@
 from flask import Flask, request, send_file
 import olefile
+import pyembroidery
+from PIL import Image, ImageDraw
 import io
 import re
-from PIL import Image
+import tempfile
+import os
 
 app = Flask(__name__)
 
@@ -12,46 +15,81 @@ def process_emb():
         return "No file uploaded", 400
     
     file = request.files['file']
-    file_bytes = io.BytesIO(file.read())
+    file_bytes = file.read()
     
-    # Validar si es un contenedor OLE real de Wilcom
-    if not olefile.isOleFile(file_bytes):
-        return "El archivo no es un .EMB válido", 400
-
+    # Intento 1: Extraer miniatura incrustada si existe
     try:
-        ole = olefile.OleFileIO(file_bytes)
-        preview_data = None
+        file_io = io.BytesIO(file_bytes)
+        if olefile.isOleFile(file_io):
+            ole = olefile.OleFileIO(file_io)
+            for stream_name in ole.listdir():
+                try:
+                    data = ole.openstream(stream_name).read()
+                    match = re.search(b'(\xFF\xD8\xFF|\x89PNG|\x42\x4D)', data)
+                    if match:
+                        raw_bytes = data[match.start():]
+                        img = Image.open(io.BytesIO(raw_bytes))
+                        output_io = io.BytesIO()
+                        img.save(output_io, 'PNG', quality=100)
+                        output_io.seek(0)
+                        return send_file(output_io, mimetype='image/png')
+                except Exception:
+                    continue
+    except Exception:
+        pass
 
-        # Escanear TODOS los flujos internos del EMB
-        for stream_name in ole.listdir():
-            try:
-                data = ole.openstream(stream_name).read()
-                # Buscar cabeceras de imagen: JPEG (\xFF\xD8\xFF), PNG (\x89PNG), BMP (\x42\x4D)
-                match = re.search(b'(\xFF\xD8\xFF|\x89PNG|\x42\x4D)', data)
-                if match:
-                    raw_bytes = data[match.start():]
-                    try:
-                        # Comprobar si PIL logra decodificar la imagen
-                        test_img = Image.open(io.BytesIO(raw_bytes))
-                        test_img.verify()
-                        preview_data = raw_bytes
-                        break
-                    except Exception:
-                        continue
-            except Exception:
-                continue
-        
-        if preview_data:
-            img = Image.open(io.BytesIO(preview_data))
+    # Intento 2: Generar trazado vectorial a partir de las puntadas
+    tmp_path = None
+    try:
+        with tempfile.NamedTemporaryFile(delete=False, suffix='.emb') as tmp:
+            tmp.write(file_bytes)
+            tmp_path = tmp.name
+
+        pattern = pyembroidery.read(tmp_path)
+        if pattern and len(pattern.stitches) > 0:
+            bounds = pattern.bounds()
+            min_x, min_y, max_x, max_y = bounds[0], bounds[1], bounds[2], bounds[3]
+            
+            margin = 30
+            width = int(max_x - min_x) + (margin * 2)
+            height = int(max_y - min_y) + (margin * 2)
+
+            width = max(width, 400)
+            height = max(height, 400)
+
+            # Lienzo oscuro industrial
+            img = Image.new('RGBA', (width, height), (18, 18, 18, 255))
+            draw = ImageDraw.Draw(img)
+
+            offset_x = -min_x + margin
+            offset_y = -min_y + margin
+
+            last_pt = None
+            for stitch in pattern.stitches:
+                x = stitch[0] + offset_x
+                y = stitch[1] + offset_y
+                flags = stitch[2]
+
+                if flags == pyembroidery.STITCH:
+                    if last_pt:
+                        # Trazado en tono rosado satinado con relieve
+                        draw.line([last_pt, (x, y)], fill=(233, 30, 99, 255), width=2)
+                    last_pt = (x, y)
+                else:
+                    last_pt = None
+
             output_io = io.BytesIO()
-            img.save(output_io, 'PNG', quality=100)
+            img.save(output_io, 'PNG')
             output_io.seek(0)
             return send_file(output_io, mimetype='image/png')
-            
-    except Exception as e:
-        return f"Error procesando EMB: {str(e)}", 500
 
-    return "No se detectó miniatura interna en el archivo .EMB", 400
+    except Exception as e:
+        return f"Error leyendo puntadas: {str(e)}", 500
+    finally:
+        if tmp_path and os.path.exists(tmp_path):
+            os.remove(tmp_path)
+
+    return "No se pudo procesar la estructura del archivo EMB", 400
 
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=5000)
